@@ -10,31 +10,205 @@ const io = socketIo(server);
 
 const PORT = process.env.PORT || 3001;
 
-// Statik dosyaları sun
-app.use(express.static(path.join(__dirname, 'public')));
+const MAX_PLAYERS = 4;
+const COLORS = ['red', 'green', 'yellow', 'blue'];
 
-let rooms = {}; // { roomId: { players, started, gameState, chat } }
+class RoomManager {
+  constructor() {
+    this.rooms = {}; // { roomId: { players, started, gameState, chat } }
+  }
 
-io.on('connection', (socket) => {
-  // Katılma
-  socket.on('joinRoom', ({ roomId, playerName }) => {
-    if (!rooms[roomId]) rooms[roomId] = { players: [], started: false, gameState: null, chat: [] };
-    if (rooms[roomId].players.length >= 4) return;
+  createRoom(roomId) {
+    if (!this.rooms[roomId]) {
+      this.rooms[roomId] = {
+        players: [],
+        started: false,
+        gameState: null,
+        chat: [],
+      };
+    }
+  }
+
+  removeRoom(roomId) {
+    delete this.rooms[roomId];
+  }
+
+  addPlayer(roomId, playerName, socketId) {
+    this.createRoom(roomId);
+    const room = this.rooms[roomId];
+    if (room.players.length >= MAX_PLAYERS) return null;
+
     const playerId = uuidv4();
-    const colorList = ['red', 'green', 'yellow', 'blue'];
-    const color = colorList[rooms[roomId].players.length];
-    rooms[roomId].players.push({
+    const color = COLORS[room.players.length];
+    const player = {
       id: playerId,
       name: playerName,
       color,
-      socketId: socket.id,
-      pieces: [0, 0, 0, 0], // 0: evde, 1-57: yolda, 58: bitiş
-    });
-    socket.join(roomId);
-    io.to(roomId).emit('updatePlayers', rooms[roomId].players);
+      socketId,
+      pieces: [0, 0, 0, 0], // 0: home, 1-57: on path, 58: finished
+      finishedCount: 0, // How many pieces reached finish
+    };
+    room.players.push(player);
+    return player;
+  }
 
-    // Oyun başlasın mı?
-    if (rooms[roomId].players.length === 4 && !rooms[roomId].started) {
+  removePlayerBySocket(socketId) {
+    for (const roomId of Object.keys(this.rooms)) {
+      const room = this.rooms[roomId];
+      const idx = room.players.findIndex(p => p.socketId === socketId);
+      if (idx !== -1) {
+        room.players.splice(idx, 1);
+        // If room is empty, remove it
+        if (room.players.length === 0) {
+          this.removeRoom(roomId);
+        }
+        return roomId;
+      }
+    }
+    return null;
+  }
+
+  getRoom(roomId) {
+    return this.rooms[roomId];
+  }
+}
+
+const roomManager = new RoomManager();
+
+io.on('connection', (socket) => {
+  // Join Room
+  socket.on('joinRoom', ({ roomId, playerName }) => {
+    const player = roomManager.addPlayer(roomId, playerName, socket.id);
+    if (!player) {
+      socket.emit('errorMsg', { message: 'Room is full or unavailable.' });
+      return;
+    }
+    socket.join(roomId);
+
+    const room = roomManager.getRoom(roomId);
+    io.to(roomId).emit('updatePlayers', room.players);
+
+    // Start Game
+    if (room.players.length === MAX_PLAYERS && !room.started) {
+      room.started = true;
+      room.gameState = {
+        turn: 0,
+        dice: 0,
+        board: room.players.map(p => [...p.pieces]),
+        finishedCounts: room.players.map(p => p.finishedCount),
+      };
+      io.to(roomId).emit('gameStarted');
+      io.to(roomId).emit('turn', { turn: 0, color: room.players[0].color });
+      io.to(roomId).emit('gameState', {
+        players: room.players.map(p => ({
+          name: p.name,
+          color: p.color,
+          pieces: p.pieces,
+          finishedCount: p.finishedCount,
+        }))
+      });
+    }
+  });
+
+  // Dice roll
+  socket.on('rollDice', ({ roomId, playerId }) => {
+    const room = roomManager.getRoom(roomId);
+    if (!room || !room.started) return;
+    const turnPlayer = room.players[room.gameState.turn];
+    if (turnPlayer.id !== playerId) return;
+
+    const dice = Math.floor(Math.random() * 6) + 1;
+    room.gameState.dice = dice;
+    io.to(roomId).emit('diceRolled', { dice, turn: room.gameState.turn });
+  });
+
+  // Move piece
+  socket.on('movePiece', ({ roomId, playerId, pieceIndex }) => {
+    const room = roomManager.getRoom(roomId);
+    if (!room || !room.started) return;
+
+    const turnPlayer = room.players[room.gameState.turn];
+    if (turnPlayer.id !== playerId) return;
+
+    const dice = room.gameState.dice;
+    let pieces = turnPlayer.pieces;
+
+    if (pieces[pieceIndex] === 0 && dice === 6) {
+      pieces[pieceIndex] = 1; // Piece comes out of home
+    } else if (pieces[pieceIndex] > 0 && pieces[pieceIndex] < 58) {
+      pieces[pieceIndex] += dice;
+      if (pieces[pieceIndex] > 58) pieces[pieceIndex] = 58;
+    } else {
+      socket.emit('errorMsg', { message: 'Invalid move.' });
+      return;
+    }
+
+    // Count finished pieces
+    turnPlayer.finishedCount = pieces.filter(p => p === 58).length;
+    room.gameState.board[room.gameState.turn] = [...pieces];
+    room.gameState.finishedCounts[room.gameState.turn] = turnPlayer.finishedCount;
+
+    // Send full game state to all clients (for real-time sync)
+    io.to(roomId).emit('boardUpdated', {
+      board: room.gameState.board,
+      players: room.players.map(p => ({
+        name: p.name,
+        color: p.color,
+        pieces: p.pieces,
+        finishedCount: p.finishedCount,
+      }))
+    });
+    room.gameState.dice = 0;
+
+    // Turn change
+    if (dice !== 6) {
+      room.gameState.turn = (room.gameState.turn + 1) % room.players.length;
+    }
+    io.to(roomId).emit('turn', { turn: room.gameState.turn, color: room.players[room.gameState.turn].color });
+
+    // Winner check
+    if (turnPlayer.finishedCount === 4) {
+      io.to(roomId).emit('gameEnd', { winner: turnPlayer });
+      roomManager.removeRoom(roomId);
+    }
+  });
+
+  // Text chat
+  socket.on('chatMessage', ({ roomId, playerName, message }) => {
+    const room = roomManager.getRoom(roomId);
+    if (!room) return;
+    const chatMsg = { playerName, message, time: Date.now() };
+    room.chat.push(chatMsg);
+    io.to(roomId).emit('chatUpdate', room.chat.slice(-50));
+  });
+
+  // Voice chat (WebRTC signaling)
+  socket.on('webrtc', ({ roomId, data }) => {
+    // Forward signaling data to other clients in the room
+    socket.to(roomId).emit('webrtc', data);
+  });
+
+  // Disconnect
+  socket.on('disconnect', () => {
+    const leftRoomId = roomManager.removePlayerBySocket(socket.id);
+    if (leftRoomId) {
+      const room = roomManager.getRoom(leftRoomId);
+      if (room) {
+        io.to(leftRoomId).emit('updatePlayers', room.players);
+        io.to(leftRoomId).emit('gameState', {
+          players: room.players.map(p => ({
+            name: p.name,
+            color: p.color,
+            pieces: p.pieces,
+            finishedCount: p.finishedCount,
+          }))
+        });
+      }
+    }
+  });
+});
+
+server.listen(PORT, () => console.log(`Server running on port ${PORT}`));    if (rooms[roomId].players.length === 4 && !rooms[roomId].started) {
       rooms[roomId].started = true;
       rooms[roomId].gameState = {
         turn: 0,
