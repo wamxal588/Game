@@ -353,7 +353,6 @@ server.listen(PORT, () => console.log(`Server running on port ${PORT}`));    con
     room.players.push(player);
     if (isBot) room.bots.push(player);
     return player;
-  }
 
   getRoom(roomId) {
     return this.rooms[roomId];
